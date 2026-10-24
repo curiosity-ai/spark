@@ -31,8 +31,8 @@ Spark is an inference server written in C# (.NET 10). Point an OpenAI or Anthrop
   token. Every call between them is signed.
 - **Zero retention, per API key.** A key can be created so that its requests are logged without their content.
 
-Models run on the CPU (x64 with AVX2 or AVX-512, and ARM64). CUDA support is implemented and compiles, but has not
-been run on a GPU yet: see [Status](#status).
+Spark places models on NVIDIA GPUs with CUDA 12 when it finds them, and otherwise runs them on the CPU (x64 with AVX2
+or AVX-512, and ARM64). See [Limitations](#limitations) for what it does not do.
 
 ## Install
 
@@ -280,12 +280,12 @@ where each came from.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SPARK_ADMIN_PASSWORD` | — **required** | Password of the console, at least 8 characters |
+| `SPARK_ADMIN_PASSWORD` | none, **required** | Password of the console, at least 8 characters |
 | `SPARK_ADMIN_USER` | `admin` | Console user name |
 | `SPARK_TITLE` | `Spark` | The name shown in the console |
 | `SPARK_SESSION_HOURS` | `168` | How long a console sign-in lasts |
 | `SPARK_REQUIRE_API_KEY` | `true` | Whether the inference endpoints need a key |
-| `SPARK_API_KEY` | — | One more accepted key (at least 16 characters), for scripts |
+| `SPARK_API_KEY` | none | One more accepted key (at least 16 characters), for scripts |
 | `SPARK_STORAGE` | `./storage` | Database, models and fleet key |
 | `SPARK_PORT` | `8080` | HTTP port |
 | `SPARK_RESTRICT_LOCALHOST` | `false` | Listen on loopback only |
@@ -295,8 +295,8 @@ where each came from.
 | `SPARK_LOG_LEVEL` | `Information` | |
 | **Models** | | |
 | `SPARK_MODELS_FOLDER` | `$SPARK_STORAGE/models` | Where GGUFs live. Any `.gguf` copied there appears in the library. |
-| `SPARK_HF_TOKEN` | — | Hugging Face token (gated repositories, rate limits) |
-| `SPARK_DEFAULT_MODEL` | — | The model for requests that name none (else the only model there is) |
+| `SPARK_HF_TOKEN` | none | Hugging Face token (gated repositories, rate limits) |
+| `SPARK_DEFAULT_MODEL` | none | The model for requests that name none (else the only model there is) |
 | `SPARK_UNKNOWN_MODEL_FALLBACK` | `false` | Serve unknown model names with the default model instead of a 404 |
 | `SPARK_CONTEXT_LENGTH` | `4096` | Default KV cache size, in tokens |
 | `SPARK_IDLE_UNLOAD_MINUTES` | `30` | Unload an unused model after this long (0 = never) |
@@ -327,10 +327,10 @@ where each came from.
 | `SPARK_ZERO_RETENTION_MEMORY_MB` | `16` | Memory for the content of the latest zero-retention requests, never written to disk. 0 keeps none. |
 | **Fleet** | | |
 | `SPARK_ROLE` | `standalone` | `standalone`, `central` or `node` |
-| `SPARK_CENTRAL_ADDRESS` | — | Node: the central's address |
+| `SPARK_CENTRAL_ADDRESS` | none | Node: the central's address |
 | `SPARK_NODE_NAME` | machine name | Node: its name on the central |
-| `SPARK_NODE_ADDRESS` | — | Node: the address the central calls it on |
-| `SPARK_JOIN_TOKEN` | — | Node: a join token from the central's **Nodes** page (used once) |
+| `SPARK_NODE_ADDRESS` | none | Node: the address the central calls it on |
+| `SPARK_JOIN_TOKEN` | none | Node: a join token from the central's **Nodes** page (used once) |
 
 ## How it works
 
@@ -338,22 +338,18 @@ where each came from.
 flowchart LR
     C[Client: OpenAI or Anthropic SDK] -->|/v1/...| S[spark server]
     A[Administrator] -->|console, /api/admin| S
-    S -->|gRPC, loopback, token| R1[spark-runner: model A]
-    S -->|gRPC| R2[spark-runner: model B]
+    S --> R1[spark-runner: model A]
+    S --> R2[spark-runner: model B]
     S -->|signed HTTP| N[spark node] --> R3[spark-runner: model C]
     S --- DB[(models, keys, request log, nodes)]
 ```
 
-- **A request** is parsed by the OpenAI or Anthropic controller, resolved to a model, given a runner by the pool
-  (which places a runner for the model where it fits and stops idle ones to make room), streamed over gRPC,
-  translated back into the API's format, and written to the request log with its timeline.
+- **A request** is resolved to a model and handed to a runner for that model, which Spark starts where the model
+  fits. The answer is streamed back in the API's format and written to the request log with its timeline.
 - **A runner** holds one model, its KV cache and its snapshots. A request whose prompt starts with the cached tokens
-  (the earlier turns of the same chat) only prefills what is new. Requests to one model run one at a time, in arrival
-  order.
-- **Crash recovery.** The server watches every runner: process exit, and a health check every 5 seconds. On a crash
-  it restarts the process and reloads the model, backing off from 1 second to a minute. Requests that were waiting
-  get the model once it is back, requests that were running fail with an error event, and a request that had not
-  started yet on a runner that died is run again.
+  (the earlier turns of the same chat) only prefills what is new.
+- **Crash recovery.** A runner that exits or fails its health check is restarted and its model reloaded. Waiting
+  requests get the model once it is back, and requests that were running fail with an error event.
 
 ## Security
 
@@ -367,15 +363,16 @@ flowchart LR
 - **`SPARK_STORAGE`** holds the API keys and the fleet key. Protect it like a secret.
 - **Images by URL** are fetched from public addresses only by default (`SPARK_IMAGE_URLS`).
 
-## Status
+## Limitations
 
-Spark is under active development. CUDA is implemented and compiles, but has not been run on a GPU yet: it is
-compile-verified only. The large model families are run by the same code path as the ones tested, but few of them
-fit the machines the tests run on. Not served yet: image and video generation, audio input, continuous batching (one
-runner answers one request at a time, and concurrent requests to a model queue).
+- No continuous batching: one runner answers one request at a time, and concurrent requests to a model queue.
+- One model cannot be split across GPUs.
+- No image or video generation, and no audio input.
+- Not the OpenAI API in full: no `n` above 1, no `logprobs`, no Responses API.
+- No TLS termination: put a reverse proxy in front.
 
 ## Origins
 
 The engine is a hard fork of [TensorSharp](https://github.com/zhongkaifu/TensorSharp) (BSD-3-Clause), which runs the
-model families on top of [ggml](https://github.com/ggml-org/ggml) (MIT). The server's shape, the console's shell and
-the fleet's signing come from the [Curiosity Orchestrator](https://github.com/curiosity-ai/orchestrator).
+model families on top of [ggml](https://github.com/ggml-org/ggml) (MIT). The server, console and fleet signing build on
+the [Curiosity Orchestrator](https://github.com/curiosity-ai/orchestrator).
